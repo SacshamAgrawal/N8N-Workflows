@@ -1,0 +1,617 @@
+{
+  "name": "Advanced Email Management System",
+  "nodes": [
+    {
+      "parameters": {
+        "triggerTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Schedule Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [240, 300]
+    },
+    {
+      "parameters": {
+        "operation": "getMany",
+        "returnAll": false,
+        "limit": 10,
+        "filters": {
+          "query": "is:unread in:inbox -label:processed"
+        }
+      },
+      "id": "get-new-emails",
+      "name": "Get New Emails",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Check if we have any emails to process\nconst emails = $input.all();\n\nif (emails.length === 0) {\n  // No new emails, return empty to end workflow\n  return [];\n}\n\n// Process each email and extract relevant information\nreturn emails.map(email => ({\n  json: {\n    messageId: email.json.id,\n    threadId: email.json.threadId,\n    snippet: email.json.snippet,\n    labelIds: email.json.labelIds || [],\n    payload: email.json.payload,\n    internalDate: email.json.internalDate,\n    isProcessed: false // Mark as not processed initially\n  }\n}));"
+      },
+      "id": "extract-email-data",
+      "name": "Extract Email Data",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Simple cache check based on messageId\n// In production, use Redis or database for persistent caching\nconst messageId = $json.messageId;\nconst threadId = $json.threadId;\n\n// For now, we'll assume all fetched emails are new since we're using the 'unread' and '-label:processed' filter\n// In a real implementation, you would check against a persistent cache\nconst cacheKey = `${threadId}_${messageId}`;\n\n// Set processing flag\n$json.isProcessed = false; // In real implementation, check actual cache\n$json.cacheKey = cacheKey;\n\nreturn [$json];"
+      },
+      "id": "check-cache",
+      "name": "Check Processing Cache",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.isProcessed }}",
+              "operation": "equal",
+              "value2": false
+            }
+          ]
+        }
+      },
+      "id": "if-not-processed",
+      "name": "If Not Processed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "messageId": "={{ $json.threadId }}",
+        "format": "full"
+      },
+      "id": "fetch-full-thread",
+      "name": "Fetch Full Email Thread",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Apply heuristic filtering based on email headers\nconst emailData = $json;\nconst payload = emailData.payload || {};\nconst headers = payload.headers || [];\n\n// Create header lookup for easier access\nconst headerMap = {};\nheaders.forEach(header => {\n  headerMap[header.name.toLowerCase()] = header.value;\n});\n\n// Heuristic rules\nlet heuristicLabel = null;\nlet confidence = 0;\n\n// Rule 1: List-Unsubscribe header indicates marketing\nif (headerMap['list-unsubscribe']) {\n  heuristicLabel = 'Marketing';\n  confidence = 0.9;\n}\n\n// Rule 2: Precedence bulk indicates marketing/notifications\nelse if (headerMap['precedence'] === 'bulk') {\n  heuristicLabel = 'Marketing';\n  confidence = 0.85;\n}\n\n// Rule 3: Auto-generated emails (like bounce notifications)\nelse if (headerMap['auto-submitted'] && headerMap['auto-submitted'] !== 'no') {\n  heuristicLabel = 'Notification';\n  confidence = 0.8;\n}\n\n// Rule 4: Calendar invitations\nelse if (headerMap['content-type']?.includes('text/calendar') || \n         payload.parts?.some(part => part.mimeType === 'text/calendar')) {\n  heuristicLabel = 'Meeting Update';\n  confidence = 0.95;\n}\n\n// Rule 5: No-reply addresses\nelse if (headerMap['from']?.includes('noreply') || headerMap['from']?.includes('no-reply')) {\n  heuristicLabel = 'Notification';\n  confidence = 0.8;\n}\n\n// Rule 6: Marketing keywords in subject\nelse if (headerMap['subject']?.toLowerCase().includes('unsubscribe') ||\n         headerMap['subject']?.toLowerCase().includes('newsletter') ||\n         headerMap['subject']?.toLowerCase().includes('promotion')) {\n  heuristicLabel = 'Marketing';\n  confidence = 0.75;\n}\n\nreturn [{ \n  json: { \n    ...emailData, \n    heuristicLabel,\n    heuristicConfidence: confidence,\n    skipHeuristics: confidence < 0.8,\n    fromEmail: headerMap['from'],\n    subject: headerMap['subject'],\n    date: headerMap['date']\n  } \n}];"
+      },
+      "id": "heuristic-filtering",
+      "name": "Apply Heuristic Rules",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.skipHeuristics }}",
+              "operation": "equal",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "if-needs-ai-processing",
+      "name": "If Needs AI Processing",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Extract and prepare email content for summarization\nconst emailData = $json;\nconst payload = emailData.payload || {};\n\n// Extract email content from payload\nfunction extractTextFromPayload(payload) {\n  if (payload.body?.data) {\n    try {\n      return Buffer.from(payload.body.data, 'base64').toString('utf-8');\n    } catch (e) {\n      return '';\n    }\n  }\n  \n  if (payload.parts) {\n    let text = '';\n    for (const part of payload.parts) {\n      if (part.mimeType === 'text/plain' && part.body?.data) {\n        try {\n          text += Buffer.from(part.body.data, 'base64').toString('utf-8');\n        } catch (e) {\n          // Skip if can't decode\n        }\n      } else if (part.parts) {\n        text += extractTextFromPayload(part);\n      }\n    }\n    return text;\n  }\n  \n  return '';\n}\n\nconst bodyText = extractTextFromPayload(payload);\nconst headers = payload.headers || [];\nconst headerMap = {};\nheaders.forEach(h => headerMap[h.name.toLowerCase()] = h.value);\n\nconst emailContent = `Subject: ${headerMap.subject || 'No Subject'}\\n` +\n                    `From: ${headerMap.from || 'Unknown Sender'}\\n` +\n                    `Date: ${headerMap.date || 'No Date'}\\n` +\n                    `Content: ${bodyText.substring(0, 2000)}\\n`; // Limit content length\n\nreturn [{ \n  json: { \n    ...emailData,\n    emailContent: emailContent.trim(),\n    bodyText: bodyText.substring(0, 2000)\n  } \n}];"
+      },
+      "id": "prepare-content",
+      "name": "Prepare Email Content",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2000, 200]
+    },
+    {
+      "parameters": {
+        "model": "mistral:7b-instruct",
+        "prompt": "Summarize the following email into a concise synopsis focusing on key points and action items. Keep the summary under 200 words and highlight the main topic, sender intent, and any required actions.\n\nEmail:\n{{ $json.emailContent }}",
+        "options": {
+          "temperature": 0.3
+        }
+      },
+      "id": "summarize-email",
+      "name": "Summarize with Ollama",
+      "type": "n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [2220, 200]
+    },
+    {
+      "parameters": {
+        "model": "mistral:7b-instruct",
+        "prompt": "Based on the following email synopsis, classify the email into one of these categories:\n- To Respond: Requires direct response or action from recipient\n- Marketing: Promotional content, newsletters, advertisements\n- Notification: System notifications, confirmations, alerts\n- FYI: Informational content that doesn't require action\n- Comment: Comments on posts, documents, or discussions\n- Meeting Update: Calendar invites, meeting changes, scheduling\n\nProvide your response in this exact JSON format:\n{\n  \"category\": \"[category name]\",\n  \"confidence\": [0.0 to 1.0],\n  \"reasoning\": \"[brief explanation]\"\n}\n\nSynopsis: {{ $('Summarize with Ollama').item.json.response }}",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "id": "classify-with-ollama",
+      "name": "Classify with Ollama",
+      "type": "n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [2440, 200]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse the Ollama classification response\nconst ollamaResponse = $json.response;\nlet classification = null;\n\ntry {\n  // Try to parse JSON response\n  const jsonMatch = ollamaResponse.match(/\\{[^}]*\\}/);\n  if (jsonMatch) {\n    classification = JSON.parse(jsonMatch[0]);\n  } else {\n    // Fallback parsing if not in JSON format\n    const categoryMatch = ollamaResponse.match(/category[\"']?:\\s?[\"']([^\"']+)[\"']?/i);\n    const confidenceMatch = ollamaResponse.match(/confidence[\"']?:\\s?([0-9.]+)/i);\n    \n    if (categoryMatch) {\n      classification = {\n        category: categoryMatch[1],\n        confidence: confidenceMatch ? parseFloat(confidenceMatch[1]) : 0.5,\n        reasoning: \"Parsed from text response\"\n      };\n    }\n  }\n} catch (error) {\n  // Default classification if parsing fails\n  classification = {\n    category: \"FYI\",\n    confidence: 0.3,\n    reasoning: \"Failed to parse Ollama response\"\n  };\n}\n\nif (!classification) {\n  classification = {\n    category: \"FYI\",\n    confidence: 0.3,\n    reasoning: \"No classification found in response\"\n  };\n}\n\nconst originalEmail = $('Fetch Full Email Thread').first().json;\n\nreturn [{ \n  json: { \n    ...originalEmail,\n    ollamaClassification: classification,\n    synopsis: $('Summarize with Ollama').first().json.response,\n    needsEscalation: classification.confidence < 0.85\n  } \n}];"
+      },
+      "id": "parse-ollama-response",
+      "name": "Parse Ollama Classification",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2660, 200]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.needsEscalation }}",
+              "operation": "equal",
+              "value2": true
+            }
+          ]
+        }
+      },
+      "id": "if-needs-escalation",
+      "name": "If Needs Escalation",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [2880, 200]
+    },
+    {
+      "parameters": {
+        "model": "gpt-4",
+        "prompt": "Based on the following email synopsis, classify the email into one of these categories:\n- To Respond: Requires direct response or action from recipient\n- Marketing: Promotional content, newsletters, advertisements  \n- Notification: System notifications, confirmations, alerts\n- FYI: Informational content that doesn't require action\n- Comment: Comments on posts, documents, or discussions\n- Meeting Update: Calendar invites, meeting changes, scheduling\n\nProvide your response in this exact JSON format:\n{\n  \"category\": \"[category name]\",\n  \"confidence\": [0.0 to 1.0],\n  \"reasoning\": \"[brief explanation]\"\n}\n\nSynopsis: {{ $json.synopsis }}",
+        "options": {
+          "temperature": 0.1
+        }
+      },
+      "id": "escalate-to-gpt4",
+      "name": "Escalate to GPT-4",
+      "type": "n8n-nodes-langchain.openai",
+      "typeVersion": 1,
+      "position": [3100, 100]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Parse GPT-4 response and merge with existing data\nconst gpt4Response = $json.response;\nlet finalClassification = null;\n\ntry {\n  const jsonMatch = gpt4Response.match(/\\{[^}]*\\}/);\n  if (jsonMatch) {\n    finalClassification = JSON.parse(jsonMatch[0]);\n  }\n} catch (error) {\n  // Use Ollama classification as fallback\n  finalClassification = $('Parse Ollama Classification').first().json.ollamaClassification;\n}\n\nif (!finalClassification) {\n  finalClassification = $('Parse Ollama Classification').first().json.ollamaClassification;\n}\n\nreturn [{ \n  json: { \n    ...($('Parse Ollama Classification').first().json),\n    finalClassification,\n    classificationSource: \"GPT-4\"\n  } \n}];"
+      },
+      "id": "parse-gpt4-response",
+      "name": "Parse GPT-4 Response",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [3320, 100]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Use Ollama classification as final classification (no escalation path)\nconst ollamaData = $json;\n\nreturn [{ \n  json: { \n    ...ollamaData,\n    finalClassification: ollamaData.ollamaClassification,\n    classificationSource: \"Ollama\"\n  } \n}];"
+      },
+      "id": "use-ollama-classification",
+      "name": "Use Ollama Classification",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [3100, 300]
+    },
+    {
+      "parameters": {
+        "mode": "mergeByIndex"
+      },
+      "id": "merge-classifications",
+      "name": "Merge Classifications",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [3540, 200]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Map categories to Gmail label names (will be converted to IDs by Gmail node)\nconst categoryLabelMap = {\n  'To Respond': 'To Respond',\n  'Marketing': 'Marketing',\n  'Notification': 'Notification', \n  'FYI': 'FYI',\n  'Comment': 'Comment',\n  'Meeting Update': 'Meeting Update'\n};\n\nconst category = $json.finalClassification?.category || 'FYI';\nconst labelName = categoryLabelMap[category] || categoryLabelMap['FYI'];\n\nreturn [{ \n  json: { \n    ...$json,\n    labelName,\n    categoryToApply: category\n  } \n}];"
+      },
+      "id": "map-to-labels",
+      "name": "Map Category to Label",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [3760, 200]
+    },
+    {
+      "parameters": {
+        "operation": "addLabels",
+        "messageId": "={{ $json.id }}",
+        "labelNames": ["={{ $json.labelName }}", "processed"]
+      },
+      "id": "apply-gmail-label",
+      "name": "Apply Gmail Label",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [3980, 200]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Use heuristic classification result and apply label\nconst emailData = $json;\nconst category = emailData.heuristicLabel;\n\n// Map to label names\nconst categoryLabelMap = {\n  'To Respond': 'To Respond',\n  'Marketing': 'Marketing', \n  'Notification': 'Notification',\n  'FYI': 'FYI',\n  'Comment': 'Comment',\n  'Meeting Update': 'Meeting Update'\n};\n\nconst labelName = categoryLabelMap[category] || categoryLabelMap['FYI'];\n\nreturn [{ \n  json: { \n    ...emailData,\n    finalClassification: {\n      category: category,\n      confidence: emailData.heuristicConfidence,\n      reasoning: \"Heuristic rule\"\n    },\n    classificationSource: \"Heuristic\",\n    labelName,\n    categoryToApply: category\n  } \n}];"
+      },
+      "id": "use-heuristic-result",
+      "name": "Use Heuristic Result",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2000, 400]
+    },
+    {
+      "parameters": {
+        "operation": "addLabels", 
+        "messageId": "={{ $json.id }}",
+        "labelNames": ["={{ $json.labelName }}", "processed"]
+      },
+      "id": "apply-heuristic-label",
+      "name": "Apply Heuristic Label",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2,
+      "position": [2220, 400]
+    },
+    {
+      "parameters": {
+        "mode": "mergeByIndex"
+      },
+      "id": "merge-final-results",
+      "name": "Merge Final Results", 
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2,
+      "position": [4200, 300]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.ANALYTICS_WEBHOOK_URL || 'https://webhook.site/your-analytics-endpoint' }}",
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "threadId",
+              "value": "={{ $json.threadId }}"
+            },
+            {
+              "name": "messageId", 
+              "value": "={{ $json.id }}"
+            },
+            {
+              "name": "label",
+              "value": "={{ $json.categoryToApply }}"
+            },
+            {
+              "name": "confidence",
+              "value": "={{ $json.finalClassification.confidence }}"
+            },
+            {
+              "name": "source",
+              "value": "={{ $json.classificationSource }}"
+            },
+            {
+              "name": "subject",
+              "value": "={{ $json.subject }}"
+            },
+            {
+              "name": "fromEmail",
+              "value": "={{ $json.fromEmail }}"
+            },
+            {
+              "name": "processedAt",
+              "value": "={{ new Date().toISOString() }}"
+            },
+            {
+              "name": "reasoning",
+              "value": "={{ $json.finalClassification.reasoning }}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "store-analytics",
+      "name": "Store Analytics",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [4420, 300]
+    }
+  ],
+  "connections": {
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get New Emails",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get New Emails": {
+      "main": [
+        [
+          {
+            "node": "Extract Email Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Email Data": {
+      "main": [
+        [
+          {
+            "node": "Check Processing Cache",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Processing Cache": {
+      "main": [
+        [
+          {
+            "node": "If Not Processed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Not Processed": {
+      "main": [
+        [
+          {
+            "node": "Fetch Full Email Thread",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Full Email Thread": {
+      "main": [
+        [
+          {
+            "node": "Apply Heuristic Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Heuristic Rules": {
+      "main": [
+        [
+          {
+            "node": "If Needs AI Processing",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Needs AI Processing": {
+      "main": [
+        [
+          {
+            "node": "Prepare Email Content",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Use Heuristic Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Email Content": {
+      "main": [
+        [
+          {
+            "node": "Summarize with Ollama",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize with Ollama": {
+      "main": [
+        [
+          {
+            "node": "Classify with Ollama",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify with Ollama": {
+      "main": [
+        [
+          {
+            "node": "Parse Ollama Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Ollama Classification": {
+      "main": [
+        [
+          {
+            "node": "If Needs Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Needs Escalation": {
+      "main": [
+        [
+          {
+            "node": "Escalate to GPT-4",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Use Ollama Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Escalate to GPT-4": {
+      "main": [
+        [
+          {
+            "node": "Parse GPT-4 Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse GPT-4 Response": {
+      "main": [
+        [
+          {
+            "node": "Merge Classifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use Ollama Classification": {
+      "main": [
+        [
+          {
+            "node": "Merge Classifications",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Classifications": {
+      "main": [
+        [
+          {
+            "node": "Map Category to Label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Category to Label": {
+      "main": [
+        [
+          {
+            "node": "Apply Gmail Label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Gmail Label": {
+      "main": [
+        [
+          {
+            "node": "Merge Final Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Use Heuristic Result": {
+      "main": [
+        [
+          {
+            "node": "Apply Heuristic Label",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Heuristic Label": {
+      "main": [
+        [
+          {
+            "node": "Merge Final Results",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge Final Results": {
+      "main": [
+        [
+          {
+            "node": "Store Analytics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "1.0.0",
+  "meta": {
+    "templateCredsSetupCompleted": true
+  },
+  "id": "advanced-email-management",
+  "tags": [
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z",
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "email-automation",
+      "name": "Email Automation"
+    },
+    {
+      "createdAt": "2024-01-01T00:00:00.000Z", 
+      "updatedAt": "2024-01-01T00:00:00.000Z",
+      "id": "ai-classification",
+      "name": "AI Classification"
+    }
+  ]
+}
